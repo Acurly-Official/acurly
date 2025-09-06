@@ -82,7 +82,14 @@ function mergeCandidates(cands = []) {
     }
     const fields = [];
     for (const [key, arr] of Object.entries(byKey)) {
-        arr.sort((a, b) => ({ pdl: 2, apollo: 1 }[b.provider] - ({ pdl: 2, apollo: 1 }[a.provider]));
+        // prefer PDL over Apollo when tied (simpler & safer comparator)
+        arr.sort((a, b) => {
+            const order = { pdl: 2, apollo: 1 };
+            const rb = order[b.provider] || 0;
+            const ra = order[a.provider] || 0;
+            return rb - ra;
+        });
+
         const best = arr[0];
         const sources = arr.map(a => ({ provider: a.provider, recency_days: a.recency_days ?? 365, value: a.value }));
         fields.push({ key, value: best.value, confidence: scoreField(sources), sources });
