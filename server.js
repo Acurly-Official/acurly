@@ -104,6 +104,9 @@ function toHubSpotProps(fields, extras = {}) {
         if (f.key === 'work_email') props['acurly_work_email'] = f.value;
         if (f.key === 'direct_phone') props['acurly_direct_phone'] = f.value;
         if (f.key === 'job_title') props['acurly_job_title'] = f.value;
+        if (f.key === 'first_name') props['acurly_first_name'] = f.value;
+        if (f.key === 'last_name') props['acurly_last_name'] = f.value;
+
     }
     const avg = fields.length ? fields.reduce((a, b) => a + b.confidence, 0) / fields.length : 0;
     props['acurly_confidence_overall'] = Math.round(avg * 100) / 100;
@@ -203,6 +206,8 @@ async function enrichWithPDL({ email, firstName, lastName, company, domain }) {
         const out = [];
         if (data.data.email) out.push({ key: 'work_email', value: data.data.email, provider: 'pdl', recency_days: 30 });
         if (data.data.job_title) out.push({ key: 'job_title', value: data.data.job_title, provider: 'pdl', recency_days: 30 });
+        if (data.data.first_name) out.push({ key: 'first_name', value: data.data.first_name, provider: 'pdl', recency_days: 30 });
+        if (data.data.last_name) out.push({ key: 'last_name', value: data.data.last_name, provider: 'pdl', recency_days: 30 });
         const phones = data.data.phone_numbers || [];
         if (phones.length) out.push({ key: 'direct_phone', value: phones[0], provider: 'pdl', recency_days: 30 });
 
@@ -503,6 +508,20 @@ app.post('/webhooks/hubspot', async (req, res) => {
             const merged = mergeCandidates(cands);
             console.log('[enrich] merged fields:', merged.map(f => `${f.key}=${f.value}`).join(', ') || '(none)');
             const props = toHubSpotProps(merged, { acurly_email_status: emailStatus });
+            // Optionally copy high-confidence names into core fields if currently blank
+            if (process.env.FILL_CORE_NAME_FIELDS === 'true') {
+                const nameThresh = parseFloat(process.env.NAME_FILL_THRESHOLD || '0.80');
+                const first = merged.find(x => x.key === 'first_name' && x.confidence >= nameThresh);
+                const last = merged.find(x => x.key === 'last_name' && x.confidence >= nameThresh);
+
+                // Fetch current names once (we already have p = hsGetContact(contactId) above)
+                const coreFirstEmpty = !p.firstname || !p.firstname.trim();
+                const coreLastEmpty = !p.lastname || !p.lastname.trim();
+
+                if (coreFirstEmpty && first) props['firstname'] = first.value;
+                if (coreLastEmpty && last) props['lastname'] = last.value;
+            }
+
             await hsUpdateContact(contactId, props);
         }
 
@@ -529,9 +548,12 @@ app.post('/admin/bootstrap', async (_req, res) => {
       { name:'acurly_enriched_at',        label:'Acurly Enriched At',        type:'datetime', fieldType:'date' },
       { name:'acurly_sources_json',       label:'Acurly Sources JSON',       type:'string', fieldType:'text' },
       { name:'acurly_email_status',       label:'Acurly Email Status',       type:'string', fieldType:'text' },
-      // nice add-ons so "something" always shows
+        // nice add-ons so "something" always shows
+      { name: 'acurly_first_name', label: 'Acurly First Name', type: 'string', fieldType: 'text' },
+      { name: 'acurly_last_name', label: 'Acurly Last Name', type: 'string', fieldType: 'text' },
       { name:'acurly_company_industry',   label:'Acurly Company Industry',   type:'string', fieldType:'text' },
       { name:'acurly_company_size',       label:'Acurly Company Size',       type:'number', fieldType:'number' }
+
     ];
 
     const exists = new Set();
@@ -551,6 +573,93 @@ app.post('/admin/bootstrap', async (_req, res) => {
     res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
+
+// --- basic auth for admin endpoints ---
+function adminAuth(req, res, next) {
+    const hdr = req.headers.authorization || '';
+    if (!hdr.startsWith('Basic ')) return res.set('WWW-Authenticate', 'Basic').status(401).send('auth required');
+    const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString('utf8').split(':');
+    if (u === process.env.ADMIN_USER && p === process.env.ADMIN_PASS) return next();
+    return res.status(403).send('forbidden');
+}
+
+// --- PREVIEW: show what we would write for a contact, but don't write ---
+app.post('/admin/preview/:id', adminAuth, async (req, res) => {
+    try {
+        const contactId = String(req.params.id);
+        const p = await hsGetContact(contactId);
+        const input = {
+            email: p.email,
+            firstName: p.firstname,
+            lastName: p.lastname,
+            company: p.company,
+            domain: (p.website || '').replace(/^https?:\/\//, '')
+        };
+
+        // Run the same pipeline but DO NOT call hsUpdateContact
+        const cands = [];
+        try { const a = await enrichWithPDL(input); if (a) cands.push(...a); } catch { }
+        const need = (k) => !cands.find(x => x.key === k);
+        if (need('work_email') || need('direct_phone') || need('job_title')) {
+            try { const b = await enrichWithApollo({ email: input.email }); if (b) cands.push(...b); } catch { }
+        }
+        let emailStatus = 'unknown';
+        const work = cands.find(x => x.key === 'work_email');
+        if (work && SMTP_VERIFY === 'true') {
+            const r = await verifyEmailWithCache(work.value);
+            emailStatus = r.status;
+            if (r.status === 'undeliverable') {
+                for (let i = cands.length - 1; i >= 0; i--) if (cands[i].key === 'work_email') cands.splice(i, 1);
+            }
+        }
+        const merged = mergeCandidates(cands);
+        const props = toHubSpotProps(merged, { acurly_email_status: emailStatus });
+
+        res.json({ input, merged, would_write: props });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+    }
+});
+app.get('/admin', adminAuth, (req, res) => {
+    res.set('Content-Type', 'text/html');
+    const cfg = {
+        ENABLE_PDL, ENABLE_APOLLO,
+        WRITEBACK_MIN_CONFIDENCE, COOLDOWN_MS, PROVIDER_CACHE_TTL_MS,
+        SMTP_VERIFY, SMTP_HELO_DOMAIN
+    };
+    res.end(`<!doctype html>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Arial;margin:24px;max-width:880px}
+    code{background:#f5f5f5;padding:2px 6px;border-radius:4px}
+    .kv{display:grid;grid-template-columns:260px 1fr;gap:8px 16px;margin:12px 0}
+    .card{border:1px solid #eee;padding:16px;border-radius:12px;margin:16px 0}
+    h2{margin-top:24px}
+    input[type=text]{width:100%}
+    a.btn{display:inline-block;padding:8px 12px;border:1px solid #ddd;border-radius:8px;text-decoration:none}
+  </style>
+  <h1>Acurly Admin</h1>
+  <div class="card">
+    <h2>Guardrails</h2>
+    <div class="kv">
+      <div>Confidence threshold</div><div><code>${cfg.WRITEBACK_MIN_CONFIDENCE}</code></div>
+      <div>Cooldown (ms)</div><div><code>${cfg.COOLDOWN_MS}</code></div>
+      <div>Provider cache TTL (ms)</div><div><code>${cfg.PROVIDER_CACHE_TTL_MS}</code></div>
+      <div>SMTP verify</div><div><code>${cfg.SMTP_VERIFY}</code> (HELO: <code>${cfg.SMTP_HELO_DOMAIN}</code>)</div>
+      <div>PDL enabled</div><div><code>${cfg.ENABLE_PDL}</code></div>
+      <div>Apollo enabled</div><div><code>${cfg.ENABLE_APOLLO}</code></div>
+    </div>
+    <p>Update these in your Render Environment and redeploy. (v1 keeps config immutable at runtime.)</p>
+  </div>
+  <div class="card">
+    <h2>Quick Checks</h2>
+    <p><a class="btn" href="/health">Health</a>
+       <a class="btn" href="/admin/stats">Stats (JSON)</a></p>
+    <p>Preview a Contact (no write): <code>POST /admin/preview/:id</code> with Basic Auth</p>
+  </div>
+  `);
+});
+
 
 // ========== START ==========
 const PORT = process.env.PORT || 3000;
