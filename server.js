@@ -574,16 +574,55 @@ app.post('/admin/bootstrap', async (_req, res) => {
   }
 });
 
-// --- basic auth for admin endpoints ---
+// ---------- ADMIN AUTH + ROUTES (paste above // ========== START ==========) ----------
 function adminAuth(req, res, next) {
     const hdr = req.headers.authorization || '';
-    if (!hdr.startsWith('Basic ')) return res.set('WWW-Authenticate', 'Basic').status(401).send('auth required');
+    if (!hdr.startsWith('Basic ')) {
+        return res.set('WWW-Authenticate', 'Basic realm="Acurly Admin"').status(401).send('auth required');
+    }
     const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString('utf8').split(':');
     if (u === process.env.ADMIN_USER && p === process.env.ADMIN_PASS) return next();
     return res.status(403).send('forbidden');
 }
 
-// --- PREVIEW: show what we would write for a contact, but don't write ---
+// Simple admin landing (read-only)
+app.get('/admin', adminAuth, (req, res) => {
+    res.set('Content-Type', 'text/html');
+    const cfg = {
+        ENABLE_PDL: process.env.ENABLE_PDL,
+        ENABLE_APOLLO: process.env.ENABLE_APOLLO,
+        WRITEBACK_MIN_CONFIDENCE: process.env.WRITEBACK_MIN_CONFIDENCE,
+        COOLDOWN_MS: process.env.COOLDOWN_MS,
+        PROVIDER_CACHE_TTL_MS: process.env.PROVIDER_CACHE_TTL_MS,
+        SMTP_VERIFY: process.env.SMTP_VERIFY,
+        SMTP_HELO_DOMAIN: process.env.SMTP_HELO_DOMAIN
+    };
+    res.end(`<!doctype html>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>body{font-family:system-ui,Arial;margin:24px;max-width:880px}code{background:#f5f5f5;padding:2px 6px;border-radius:4px}
+  .kv{display:grid;grid-template-columns:260px 1fr;gap:8px 16px;margin:12px 0}.card{border:1px solid #eee;padding:16px;border-radius:12px;margin:16px 0}</style>
+  <h1>Acurly Admin</h1>
+  <div class="card">
+    <h2>Guardrails</h2>
+    <div class="kv">
+      <div>Confidence threshold</div><div><code>${cfg.WRITEBACK_MIN_CONFIDENCE || ''}</code></div>
+      <div>Cooldown (ms)</div><div><code>${cfg.COOLDOWN_MS || ''}</code></div>
+      <div>Provider cache TTL (ms)</div><div><code>${cfg.PROVIDER_CACHE_TTL_MS || ''}</code></div>
+      <div>SMTP verify</div><div><code>${cfg.SMTP_VERIFY || ''}</code> (HELO: <code>${cfg.SMTP_HELO_DOMAIN || ''}</code>)</div>
+      <div>PDL enabled</div><div><code>${cfg.ENABLE_PDL || ''}</code></div>
+      <div>Apollo enabled</div><div><code>${cfg.ENABLE_APOLLO || ''}</code></div>
+    </div>
+    <p>Update these in Render → Environment and redeploy.</p>
+  </div>
+  <div class="card">
+    <h2>Endpoints</h2>
+    <p><code>GET /admin</code> (this page)</p>
+    <p><code>POST /admin/preview/:id</code> (dry-run; no writeback)</p>
+    <p><a href="/admin/stats">/admin/stats</a> (JSON metrics; not auth-protected in some builds)</p>
+  </div>`);
+});
+
+// PREVIEW: show what we WOULD write (no writeback)
 app.post('/admin/preview/:id', adminAuth, async (req, res) => {
     try {
         const contactId = String(req.params.id);
@@ -596,68 +635,29 @@ app.post('/admin/preview/:id', adminAuth, async (req, res) => {
             domain: (p.website || '').replace(/^https?:\/\//, '')
         };
 
-        // Run the same pipeline but DO NOT call hsUpdateContact
         const cands = [];
         try { const a = await enrichWithPDL(input); if (a) cands.push(...a); } catch { }
         const need = (k) => !cands.find(x => x.key === k);
         if (need('work_email') || need('direct_phone') || need('job_title')) {
             try { const b = await enrichWithApollo({ email: input.email }); if (b) cands.push(...b); } catch { }
         }
+
         let emailStatus = 'unknown';
         const work = cands.find(x => x.key === 'work_email');
-        if (work && SMTP_VERIFY === 'true') {
+        if (work && process.env.SMTP_VERIFY === 'true') {
             const r = await verifyEmailWithCache(work.value);
             emailStatus = r.status;
             if (r.status === 'undeliverable') {
                 for (let i = cands.length - 1; i >= 0; i--) if (cands[i].key === 'work_email') cands.splice(i, 1);
             }
         }
+
         const merged = mergeCandidates(cands);
         const props = toHubSpotProps(merged, { acurly_email_status: emailStatus });
-
         res.json({ input, merged, would_write: props });
     } catch (e) {
         res.status(500).json({ ok: false, error: e?.response?.data || e.message });
     }
-});
-app.get('/admin', adminAuth, (req, res) => {
-    res.set('Content-Type', 'text/html');
-    const cfg = {
-        ENABLE_PDL, ENABLE_APOLLO,
-        WRITEBACK_MIN_CONFIDENCE, COOLDOWN_MS, PROVIDER_CACHE_TTL_MS,
-        SMTP_VERIFY, SMTP_HELO_DOMAIN
-    };
-    res.end(`<!doctype html>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:system-ui,Arial;margin:24px;max-width:880px}
-    code{background:#f5f5f5;padding:2px 6px;border-radius:4px}
-    .kv{display:grid;grid-template-columns:260px 1fr;gap:8px 16px;margin:12px 0}
-    .card{border:1px solid #eee;padding:16px;border-radius:12px;margin:16px 0}
-    h2{margin-top:24px}
-    input[type=text]{width:100%}
-    a.btn{display:inline-block;padding:8px 12px;border:1px solid #ddd;border-radius:8px;text-decoration:none}
-  </style>
-  <h1>Acurly Admin</h1>
-  <div class="card">
-    <h2>Guardrails</h2>
-    <div class="kv">
-      <div>Confidence threshold</div><div><code>${cfg.WRITEBACK_MIN_CONFIDENCE}</code></div>
-      <div>Cooldown (ms)</div><div><code>${cfg.COOLDOWN_MS}</code></div>
-      <div>Provider cache TTL (ms)</div><div><code>${cfg.PROVIDER_CACHE_TTL_MS}</code></div>
-      <div>SMTP verify</div><div><code>${cfg.SMTP_VERIFY}</code> (HELO: <code>${cfg.SMTP_HELO_DOMAIN}</code>)</div>
-      <div>PDL enabled</div><div><code>${cfg.ENABLE_PDL}</code></div>
-      <div>Apollo enabled</div><div><code>${cfg.ENABLE_APOLLO}</code></div>
-    </div>
-    <p>Update these in your Render Environment and redeploy. (v1 keeps config immutable at runtime.)</p>
-  </div>
-  <div class="card">
-    <h2>Quick Checks</h2>
-    <p><a class="btn" href="/health">Health</a>
-       <a class="btn" href="/admin/stats">Stats (JSON)</a></p>
-    <p>Preview a Contact (no write): <code>POST /admin/preview/:id</code> with Basic Auth</p>
-  </div>
-  `);
 });
 
 
